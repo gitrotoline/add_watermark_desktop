@@ -32,5 +32,8 @@ nul
 *.tmp
 *.temp
 
+# Configuracao com credenciais
+config.json
+
 # Claude
 .claude/

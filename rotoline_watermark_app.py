@@ -54,6 +54,25 @@ try:
 except ImportError:
     REMBG_AVAILABLE = False
 
+# Verifica se boto3 e psycopg2 estao disponiveis (para Upload S3)
+try:
+    import boto3
+    BOTO3_AVAILABLE = True
+except ImportError:
+    BOTO3_AVAILABLE = False
+
+try:
+    import psycopg2
+    PSYCOPG2_AVAILABLE = True
+except ImportError:
+    PSYCOPG2_AVAILABLE = False
+
+try:
+    from s3_db_service import DatabaseService, S3Service, extract_sap_code, load_upload_config
+    S3_SERVICE_AVAILABLE = True
+except ImportError:
+    S3_SERVICE_AVAILABLE = False
+
 
 # ============================================================
 # TEMA MODERNO - DESIGN SYSTEM
@@ -964,6 +983,14 @@ class App(tk.Tk):
         self.single_pos_x = tk.DoubleVar(value=0.5)
         self.single_pos_y = tk.DoubleVar(value=0.5)
 
+        # Upload S3
+        self.upload_source = tk.StringVar()
+        self.upload_s3_directory = tk.StringVar(value="pecas")
+        self.upload_items = []          # lista de (Path, sap_code)
+        self._upload_cancel_flag = False
+        self._upload_rows = []          # referencias aos widgets das linhas da tabela
+        self._upload_running = False
+
     def _check_watermark(self):
         """Verifica se o arquivo de marca d'agua existe."""
         if not WATERMARK_FILE.exists():
@@ -1076,16 +1103,19 @@ class App(tk.Tk):
         self.tab_batch = tk.Frame(self.notebook, bg=COLORS["bg"])
         self.tab_watch = tk.Frame(self.notebook, bg=COLORS["bg"])
         self.tab_settings = tk.Frame(self.notebook, bg=COLORS["bg"])
+        self.tab_upload = tk.Frame(self.notebook, bg=COLORS["bg"])
 
         self.notebook.add(self.tab_single, text="  Uma Foto  ")
         self.notebook.add(self.tab_batch, text="  Varias Fotos  ")
         self.notebook.add(self.tab_watch, text="  Monitorar Pasta  ")
+        self.notebook.add(self.tab_upload, text="  Upload S3  ")
         self.notebook.add(self.tab_settings, text="  Configuracoes  ")
 
         # Construir conteudo das abas
         self._build_single_tab()
         self._build_batch_tab()
         self._build_watch_tab()
+        self._build_upload_tab()
         self._build_settings_tab()
 
     def _build_single_tab(self):
@@ -2096,6 +2126,672 @@ class App(tk.Tk):
                 self.after(0, lambda e=str(e): self._append_watch_log(f"Erro: {e}", "error"))
 
             time.sleep(1)
+
+    # ============================================================
+    # METODOS - UPLOAD S3
+    # ============================================================
+
+    def _build_upload_tab(self):
+        """Aba para upload de imagens com marca d'agua para S3."""
+        main = tk.Frame(self.tab_upload, bg=COLORS["bg"])
+        main.pack(fill="both", expand=True, padx=10, pady=10)
+
+        # Verificar dependencias
+        deps_ok = BOTO3_AVAILABLE and PSYCOPG2_AVAILABLE and S3_SERVICE_AVAILABLE
+        if not deps_ok:
+            missing = []
+            if not BOTO3_AVAILABLE:
+                missing.append("boto3")
+            if not PSYCOPG2_AVAILABLE:
+                missing.append("psycopg2-binary")
+            if not S3_SERVICE_AVAILABLE:
+                missing.append("s3_db_service (modulo local)")
+
+            warn_card = Card(main, title="Dependencias Ausentes")
+            warn_card.pack(fill="x", pady=(0, 10))
+            tk.Label(
+                warn_card,
+                text=f"Instale os pacotes necessarios:\npip install {' '.join(missing)}",
+                font=FONTS["body"],
+                bg=COLORS["bg_card"],
+                fg=COLORS["danger"],
+                justify="left"
+            ).pack(anchor="w", pady=5)
+            return
+
+        # Layout em duas colunas
+        left_col = tk.Frame(main, bg=COLORS["bg"])
+        left_col.pack(side="left", fill="both", expand=True, padx=(0, 10))
+
+        right_col = tk.Frame(main, bg=COLORS["bg"])
+        right_col.pack(side="right", fill="y")
+
+        # === COLUNA ESQUERDA ===
+
+        # Card 1: Selecionar Imagens
+        card1 = Card(left_col, title="1. Selecionar Imagens")
+        card1.pack(fill="x", pady=(0, 10))
+
+        self.upload_path_label = tk.Label(
+            card1,
+            text="Nenhuma imagem selecionada",
+            font=FONTS["small"],
+            bg=COLORS["bg_card"],
+            fg=COLORS["text_muted"],
+            anchor="w"
+        )
+        self.upload_path_label.pack(fill="x", pady=(0, 8))
+
+        btn_sel_frame = tk.Frame(card1, bg=COLORS["bg_card"])
+        btn_sel_frame.pack(fill="x")
+
+        ModernButton(
+            btn_sel_frame,
+            text="Selecionar Arquivo(s)",
+            icon="📄",
+            command=self._pick_upload_files,
+            style="primary",
+            tooltip="Selecione uma ou mais imagens para upload"
+        ).pack(side="left", fill="x", expand=True, padx=(0, 5))
+
+        ModernButton(
+            btn_sel_frame,
+            text="Selecionar Pasta",
+            icon="📂",
+            command=self._pick_upload_folder,
+            style="primary",
+            tooltip="Selecione uma pasta com imagens"
+        ).pack(side="left", fill="x", expand=True, padx=(5, 0))
+
+        self.upload_count_label = tk.Label(
+            card1,
+            text="",
+            font=FONTS["small"],
+            bg=COLORS["bg_card"],
+            fg=COLORS["primary"]
+        )
+        self.upload_count_label.pack(anchor="w", pady=(8, 0))
+
+        # Card 2: Tabela de imagens encontradas
+        card2 = Card(left_col, title="2. Imagens Encontradas")
+        card2.pack(fill="both", expand=True, pady=(0, 10))
+
+        # Cabecalho da tabela
+        header_frame = tk.Frame(card2, bg=COLORS["bg_dark"])
+        header_frame.pack(fill="x")
+
+        tk.Label(header_frame, text="#", width=4, font=FONTS["small"],
+                 bg=COLORS["bg_dark"], fg=COLORS["text_secondary"]).pack(side="left")
+        tk.Label(header_frame, text="Arquivo", width=28, font=FONTS["small"],
+                 bg=COLORS["bg_dark"], fg=COLORS["text_secondary"], anchor="w").pack(side="left")
+        tk.Label(header_frame, text="Codigo SAP", width=14, font=FONTS["small"],
+                 bg=COLORS["bg_dark"], fg=COLORS["text_secondary"]).pack(side="left")
+        tk.Label(header_frame, text="Status", width=10, font=FONTS["small"],
+                 bg=COLORS["bg_dark"], fg=COLORS["text_secondary"]).pack(side="left")
+
+        # Area scrollavel
+        table_container = tk.Frame(card2, bg=COLORS["bg_card"])
+        table_container.pack(fill="both", expand=True)
+
+        self.upload_table_canvas = tk.Canvas(
+            table_container, bg=COLORS["bg_card"],
+            highlightthickness=0, height=150
+        )
+        upload_scrollbar = ttk.Scrollbar(
+            table_container, orient="vertical",
+            command=self.upload_table_canvas.yview
+        )
+        self.upload_table_inner = tk.Frame(self.upload_table_canvas, bg=COLORS["bg_card"])
+
+        self.upload_table_inner.bind("<Configure>", lambda e: self.upload_table_canvas.configure(
+            scrollregion=self.upload_table_canvas.bbox("all")
+        ))
+
+        self.upload_table_canvas.create_window((0, 0), window=self.upload_table_inner, anchor="nw")
+        self.upload_table_canvas.configure(yscrollcommand=upload_scrollbar.set)
+
+        self.upload_table_canvas.pack(side="left", fill="both", expand=True)
+        upload_scrollbar.pack(side="right", fill="y")
+
+        # Scroll com mouse
+        self.upload_table_canvas.bind("<MouseWheel>", lambda e: self.upload_table_canvas.yview_scroll(
+            int(-1 * (e.delta / 120)), "units"
+        ))
+
+        # Card 3: Progresso
+        card3 = Card(left_col, title="3. Progresso")
+        card3.pack(fill="x", pady=(0, 10))
+
+        self.upload_status = tk.Label(
+            card3,
+            text="Aguardando...",
+            font=FONTS["body"],
+            bg=COLORS["bg_card"],
+            fg=COLORS["text"]
+        )
+        self.upload_status.pack(anchor="w")
+
+        self.upload_progress = ttk.Progressbar(
+            card3,
+            mode="determinate",
+            style="Modern.Horizontal.TProgressbar"
+        )
+        self.upload_progress.pack(fill="x", pady=(10, 0))
+
+        # Botoes
+        btn_frame = tk.Frame(left_col, bg=COLORS["bg"])
+        btn_frame.pack(fill="x", pady=(0, 10))
+
+        self.btn_upload_run = ModernButton(
+            btn_frame,
+            text="PROCESSAR E ENVIAR",
+            icon="☁",
+            command=self._run_upload,
+            style="success",
+            size="large",
+            tooltip="Aplica marca d'agua e envia para S3"
+        )
+        self.btn_upload_run.pack(side="left", fill="x", expand=True, padx=(0, 5))
+
+        self.btn_upload_cancel = ModernButton(
+            btn_frame,
+            text="CANCELAR",
+            icon="⏹",
+            command=self._cancel_upload,
+            style="danger",
+            size="large",
+            tooltip="Cancela o upload em andamento"
+        )
+        self.btn_upload_cancel.pack(side="left", fill="x", expand=True, padx=(5, 0))
+        self.btn_upload_cancel.pack_forget()  # Oculto inicialmente
+
+        # Card 4: Log
+        card4 = Card(left_col, title="Historico")
+        card4.pack(fill="both", expand=True)
+
+        log_frame = tk.Frame(card4, bg=COLORS["bg_dark"])
+        log_frame.pack(fill="both", expand=True)
+
+        self.upload_log = tk.Text(
+            log_frame,
+            height=6,
+            wrap="word",
+            font=FONTS["mono"],
+            bg=COLORS["bg_dark"],
+            fg=COLORS["text"],
+            relief="flat",
+            padx=10,
+            pady=10
+        )
+        self.upload_log.pack(fill="both", expand=True)
+
+        self.upload_log.tag_configure("success", foreground=COLORS["success"])
+        self.upload_log.tag_configure("error", foreground=COLORS["danger"])
+        self.upload_log.tag_configure("info", foreground=COLORS["primary"])
+        self.upload_log.tag_configure("warning", foreground=COLORS["warning"])
+
+        # === COLUNA DIREITA (Configuracoes) ===
+
+        # Card 5: Configuracao S3
+        card5 = Card(right_col, title="Configuracao S3")
+        card5.pack(fill="x", pady=(0, 10))
+
+        tk.Label(
+            card5, text="Diretorio no S3:",
+            font=FONTS["small"],
+            bg=COLORS["bg_card"],
+            fg=COLORS["text_secondary"]
+        ).pack(anchor="w")
+
+        s3_dir_entry = tk.Entry(
+            card5,
+            textvariable=self.upload_s3_directory,
+            font=FONTS["body"],
+            bg=COLORS["bg_dark"],
+            fg=COLORS["text"],
+            insertbackground=COLORS["text"],
+            relief="flat"
+        )
+        s3_dir_entry.pack(fill="x", pady=(4, 0), ipady=4)
+
+        # Card 6: Configuracao de Processamento
+        card6 = Card(right_col, title="Processamento")
+        card6.pack(fill="x", pady=(0, 10))
+
+        ModernCheckbox(
+            card6,
+            "Remover fundo",
+            self.remove_bg,
+            tooltip="Remove automaticamente o fundo das imagens"
+        ).pack(fill="x", pady=(0, 8))
+
+        # Metodo
+        method_frame_upload = tk.Frame(card6, bg=COLORS["bg_card"])
+        method_frame_upload.pack(fill="x", pady=(0, 8))
+
+        tk.Label(
+            method_frame_upload, text="Metodo:",
+            font=FONTS["small"],
+            bg=COLORS["bg_card"],
+            fg=COLORS["text_secondary"]
+        ).pack(side="left")
+
+        methods = ["Simples"]
+        if REMBG_AVAILABLE:
+            methods.append("IA")
+
+        self.upload_method_combo = ttk.Combobox(
+            method_frame_upload,
+            values=methods,
+            state="readonly",
+            width=10,
+            font=FONTS["small"]
+        )
+        self.upload_method_combo.current(0)
+        self.upload_method_combo.pack(side="right")
+
+        ModernSlider(
+            card6, "Margem", self.padding,
+            0.05, 0.18,
+            lambda v: f"{int(float(v)*100)}%"
+        ).pack(fill="x", pady=4)
+
+        ModernSlider(
+            card6, "Intensidade", self.wm_strength,
+            1.0, 3.0,
+            lambda v: f"{float(v):.1f}x"
+        ).pack(fill="x", pady=4)
+
+        # Card 7: Conexao
+        card7 = Card(right_col, title="Conexao")
+        card7.pack(fill="x", pady=(0, 10))
+
+        conn_grid = tk.Frame(card7, bg=COLORS["bg_card"])
+        conn_grid.pack(fill="x")
+
+        tk.Label(conn_grid, text="Banco de dados:", font=FONTS["small"],
+                 bg=COLORS["bg_card"], fg=COLORS["text_secondary"]).grid(row=0, column=0, sticky="w")
+        self.db_status_dot = tk.Label(conn_grid, text="●", font=FONTS["small"],
+                                      bg=COLORS["bg_card"], fg=COLORS["text_muted"])
+        self.db_status_dot.grid(row=0, column=1, padx=(10, 0))
+
+        tk.Label(conn_grid, text="AWS S3:", font=FONTS["small"],
+                 bg=COLORS["bg_card"], fg=COLORS["text_secondary"]).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        self.s3_status_dot = tk.Label(conn_grid, text="●", font=FONTS["small"],
+                                      bg=COLORS["bg_card"], fg=COLORS["text_muted"])
+        self.s3_status_dot.grid(row=1, column=1, padx=(10, 0), pady=(4, 0))
+
+        ModernButton(
+            card7,
+            text="Testar Conexao",
+            icon="🔌",
+            command=self._test_connections,
+            style="secondary",
+            tooltip="Testa conexao com o banco de dados e S3"
+        ).pack(fill="x", pady=(10, 0))
+
+    def _pick_upload_files(self):
+        """Abre dialog para selecionar arquivos de imagem para upload."""
+        ext_list = " ".join(f"*{e}" for e in SUPPORTED_EXT)
+        files = filedialog.askopenfilenames(
+            title="Selecione as imagens para upload",
+            filetypes=[("Imagens", ext_list), ("Todos", "*.*")]
+        )
+        if files:
+            paths = [Path(f) for f in files]
+            self.upload_path_label.config(
+                text=f"{len(paths)} arquivo(s) selecionado(s)",
+                fg=COLORS["text"]
+            )
+            self._scan_and_populate_table(paths)
+
+    def _pick_upload_folder(self):
+        """Abre dialog para selecionar pasta com imagens para upload."""
+        folder = filedialog.askdirectory(title="Selecione a pasta com imagens")
+        if folder:
+            folder_path = Path(folder)
+            files = list(iter_images(folder_path))
+            if not files:
+                messagebox.showinfo("Atencao", "Nenhuma imagem encontrada na pasta selecionada.")
+                return
+            self.upload_path_label.config(
+                text=f"Pasta: {folder_path.name}",
+                fg=COLORS["text"]
+            )
+            self._scan_and_populate_table(files)
+
+    def _scan_and_populate_table(self, paths):
+        """Extrai codigos SAP e preenche a tabela de imagens."""
+        self._clear_upload_table()
+        self.upload_items = []
+        self._upload_rows = []
+
+        for i, path in enumerate(paths):
+            sap_code = extract_sap_code(path.name)
+            self.upload_items.append((path, sap_code))
+            self._add_table_row(i + 1, path.name, sap_code)
+
+        self.upload_count_label.config(text=f"{len(paths)} imagem(ns) encontrada(s)")
+
+    def _clear_upload_table(self):
+        """Remove todas as linhas da tabela de imagens."""
+        for widget in self.upload_table_inner.winfo_children():
+            widget.destroy()
+        self._upload_rows = []
+        self.upload_items = []
+        self.upload_count_label.config(text="")
+
+    def _add_table_row(self, index, filename, sap_code):
+        """Adiciona uma linha na tabela de imagens."""
+        bg = COLORS["bg_card"] if index % 2 == 0 else COLORS["bg_dark"]
+
+        row = tk.Frame(self.upload_table_inner, bg=bg)
+        row.pack(fill="x")
+
+        tk.Label(row, text=str(index), width=4, font=FONTS["small"],
+                 bg=bg, fg=COLORS["text"]).pack(side="left")
+
+        # Truncar nome se muito longo
+        display_name = filename if len(filename) <= 28 else filename[:25] + "..."
+        tk.Label(row, text=display_name, width=28, font=FONTS["small"],
+                 bg=bg, fg=COLORS["text"], anchor="w").pack(side="left")
+
+        tk.Label(row, text=sap_code, width=14, font=FONTS["small"],
+                 bg=bg, fg=COLORS["primary"]).pack(side="left")
+
+        status_lbl = tk.Label(row, text="Pendente", width=10, font=FONTS["small"],
+                              bg=bg, fg=COLORS["text_muted"])
+        status_lbl.pack(side="left")
+
+        self._upload_rows.append({
+            "frame": row,
+            "status_label": status_lbl,
+            "bg": bg,
+        })
+
+    def _update_row_status(self, index, status, message=""):
+        """Atualiza o status visual de uma linha na tabela."""
+        if index >= len(self._upload_rows):
+            return
+
+        row_data = self._upload_rows[index]
+        status_lbl = row_data["status_label"]
+
+        status_map = {
+            "pending": ("Pendente", COLORS["text_muted"]),
+            "processing": ("Processando", COLORS["warning"]),
+            "uploading": ("Enviando...", COLORS["primary"]),
+            "updating": ("Atualizando", COLORS["primary"]),
+            "success": ("OK", COLORS["success"]),
+            "error": ("Erro", COLORS["danger"]),
+            "skipped": ("Pulado", COLORS["text_muted"]),
+        }
+
+        text, color = status_map.get(status, ("?", COLORS["text"]))
+        status_lbl.config(text=text, fg=color)
+
+    def _append_upload_log(self, msg, tag=None):
+        """Adiciona mensagem ao log do upload."""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.upload_log.insert("end", f"[{timestamp}] {msg}\n", tag)
+        self.upload_log.see("end")
+
+    def _load_upload_config(self):
+        """Carrega configuracao de upload."""
+        return load_upload_config()
+
+    def _test_connections(self):
+        """Testa conexoes com DB e S3 em thread separada."""
+        self.db_status_dot.config(fg=COLORS["warning"], text="●")
+        self.s3_status_dot.config(fg=COLORS["warning"], text="●")
+
+        def _test():
+            config = self._load_upload_config()
+
+            # Testar DB
+            try:
+                db = DatabaseService(**config["database"])
+                db_ok = db.test_connection()
+            except Exception:
+                db_ok = False
+
+            self.after(0, lambda: self.db_status_dot.config(
+                fg=COLORS["success"] if db_ok else COLORS["danger"]
+            ))
+
+            # Testar S3
+            try:
+                s3 = S3Service(
+                    config["aws"]["access_key_id"],
+                    config["aws"]["secret_access_key"]
+                )
+                s3_ok = s3.test_connection()
+            except Exception:
+                s3_ok = False
+
+            self.after(0, lambda: self.s3_status_dot.config(
+                fg=COLORS["success"] if s3_ok else COLORS["danger"]
+            ))
+
+            if db_ok and s3_ok:
+                self.after(0, lambda: self._append_upload_log("Conexoes OK", "success"))
+            else:
+                msgs = []
+                if not db_ok:
+                    msgs.append("Banco de dados: FALHA")
+                if not s3_ok:
+                    msgs.append("S3: FALHA")
+                self.after(0, lambda m=", ".join(msgs): self._append_upload_log(
+                    f"Erro de conexao - {m}", "error"
+                ))
+
+        threading.Thread(target=_test, daemon=True).start()
+
+    def _run_upload(self):
+        """Valida e inicia o processo de upload."""
+        if self._upload_running:
+            return
+
+        if not self.upload_items:
+            messagebox.showinfo("Atencao", "Selecione imagens antes de processar.")
+            return
+
+        if not WATERMARK_FILE.exists():
+            messagebox.showerror("Erro", "Arquivo de marca d'agua nao encontrado.")
+            return
+
+        config = self._load_upload_config()
+
+        # Verificar credenciais
+        if not config["aws"]["access_key_id"] or not config["aws"]["secret_access_key"]:
+            messagebox.showerror(
+                "Erro",
+                "Credenciais AWS nao configuradas.\n\n"
+                "Configure as variaveis de ambiente:\n"
+                "AWS_ACCESS_KEY_ID\nAWS_SECRET_ACCESS_KEY\n\n"
+                "Ou preencha o arquivo config.json."
+            )
+            return
+
+        if not config["database"]["password"]:
+            messagebox.showerror(
+                "Erro",
+                "Senha do banco de dados nao configurada.\n\n"
+                "Configure a variavel de ambiente DB_PASSWORD\n"
+                "ou preencha o arquivo config.json."
+            )
+            return
+
+        # Iniciar upload
+        self._upload_running = True
+        self._upload_cancel_flag = False
+        self.btn_upload_run.set_loading(True, text="Processando...")
+        self.btn_upload_cancel.pack(side="left", fill="x", expand=True, padx=(5, 0))
+        self.upload_log.delete("1.0", "end")
+        self.upload_status.config(text="Iniciando...")
+        self.upload_progress.config(value=0)
+
+        # Reset status das linhas
+        for i in range(len(self._upload_rows)):
+            self._update_row_status(i, "pending")
+
+        threading.Thread(target=self._upload_worker, daemon=True, args=(config,)).start()
+
+    def _cancel_upload(self):
+        """Seta flag de cancelamento."""
+        self._upload_cancel_flag = True
+        self.upload_status.config(text="Cancelando...")
+
+    def _upload_worker(self, config):
+        """Worker thread: validar -> processar -> upload -> update DB."""
+        db = None
+        try:
+            items = list(self.upload_items)
+            total = len(items)
+            sap_codes = [sap for _, sap in items]
+
+            # Fase 1: Conectar e validar SAP codes
+            self.after(0, lambda: self.upload_status.config(text="Conectando ao banco de dados..."))
+            self.after(0, lambda: self._append_upload_log("Conectando ao banco de dados...", "info"))
+
+            db = DatabaseService(**config["database"])
+            db.connect()
+
+            self.after(0, lambda: self.upload_status.config(text="Validando codigos SAP..."))
+            self.after(0, lambda: self._append_upload_log("Validando codigos SAP...", "info"))
+
+            unique_codes = list(set(sap_codes))
+            found, missing = db.validate_sap_codes(unique_codes)
+
+            if missing:
+                missing_str = ", ".join(missing)
+                self.after(0, lambda m=missing_str: self._show_validation_error(m))
+                # Marcar linhas com SAP faltante como erro
+                for i, (_, sap) in enumerate(items):
+                    if sap in missing:
+                        self.after(0, lambda idx=i: self._update_row_status(idx, "error"))
+                return
+
+            self.after(0, lambda: self._append_upload_log(
+                f"Todos os {len(unique_codes)} codigo(s) SAP validados!", "success"
+            ))
+
+            # Fase 2: Conectar S3
+            self.after(0, lambda: self.upload_status.config(text="Conectando ao S3..."))
+            s3 = S3Service(config["aws"]["access_key_id"], config["aws"]["secret_access_key"])
+
+            # Fase 3: Carregar marca d'agua
+            wm = Image.open(WATERMARK_FILE).convert("RGBA")
+            if wm.size != OUT_SIZE:
+                wm = wm.resize(OUT_SIZE, Image.LANCZOS)
+
+            strength = float(self.wm_strength.get())
+            wm = boost_watermark_alpha(wm, factor=strength)
+
+            remove_bg_flag = bool(self.remove_bg.get())
+            padding_val = float(self.padding.get())
+            thr_val = int(self.thr.get())
+            out_format = self.out_format.get()
+
+            method_text = self.upload_method_combo.get()
+            bg_method = "ai" if "IA" in method_text else "simple"
+
+            pos_x_val = float(self.pos_x.get())
+            pos_y_val = float(self.pos_y.get())
+
+            s3_directory = self.upload_s3_directory.get().strip() or "pecas"
+
+            self.after(0, lambda: self.upload_progress.config(maximum=total, value=0))
+
+            done = 0
+            errors = 0
+            start_time = time.time()
+
+            # Fase 4: Processar e enviar cada imagem
+            for i, (path, sap_code) in enumerate(items):
+                if self._upload_cancel_flag:
+                    self.after(0, lambda: self._append_upload_log("Cancelado pelo usuario.", "warning"))
+                    break
+
+                self.after(0, lambda idx=i: self._update_row_status(idx, "processing"))
+                self.after(0, lambda v=i+1, t=total: self.upload_status.config(
+                    text=f"Processando imagem {v}/{t}..."
+                ))
+
+                try:
+                    # Processar imagem (aplicar marca d'agua)
+                    img = Image.open(path).convert("RGBA")
+                    result = process_image(
+                        img, wm, padding_val, thr_val,
+                        remove_bg_flag, bg_method, pos_x_val, pos_y_val
+                    )
+
+                    # Upload para S3
+                    self.after(0, lambda idx=i: self._update_row_status(idx, "uploading"))
+                    s3_key = s3.generate_s3_key(s3_directory, path.name)
+                    url = s3.upload_image(result, s3_key, out_format)
+
+                    # Atualizar banco de dados
+                    self.after(0, lambda idx=i: self._update_row_status(idx, "updating"))
+                    db.update_image_url(sap_code, url)
+
+                    # Sucesso
+                    self.after(0, lambda idx=i: self._update_row_status(idx, "success"))
+                    self.after(0, lambda s=path.name, u=url: self._append_upload_log(
+                        f"[OK] {s} -> {u}", "success"
+                    ))
+
+                except Exception as e:
+                    errors += 1
+                    self.after(0, lambda idx=i: self._update_row_status(idx, "error"))
+                    self.after(0, lambda s=path.name, er=str(e): self._append_upload_log(
+                        f"[ERRO] {s}: {er}", "error"
+                    ))
+
+                done += 1
+                self.after(0, lambda v=done: self.upload_progress.config(value=v))
+
+            elapsed = time.time() - start_time
+            success_count = done - errors
+
+            # Resumo final
+            if self._upload_cancel_flag:
+                summary = f"Cancelado: {success_count} enviadas, {errors} erros, {total - done} pendentes ({elapsed:.1f}s)"
+            elif errors == 0:
+                summary = f"Concluido! {success_count} imagem(ns) enviadas em {elapsed:.1f}s"
+            else:
+                summary = f"Concluido: {success_count} OK, {errors} erros em {elapsed:.1f}s"
+
+            self.after(0, lambda s=summary: self.upload_status.config(text=s))
+            self.after(0, lambda s=summary: self._append_upload_log(f"\n{s}", "info"))
+            self.after(0, lambda s=summary: messagebox.showinfo("Upload S3", s))
+
+        except Exception as e:
+            self.after(0, lambda er=str(e): self._append_upload_log(f"[ERRO FATAL] {er}", "error"))
+            self.after(0, lambda er=str(e): messagebox.showerror("Erro", f"Erro durante upload:\n{er}"))
+
+        finally:
+            if db:
+                db.disconnect()
+            self._upload_running = False
+            self.after(0, lambda: self.btn_upload_run.set_loading(False))
+            self.after(0, lambda: self.btn_upload_cancel.pack_forget())
+
+    def _show_validation_error(self, missing_codes_str):
+        """Mostra dialog com codigos SAP nao encontrados no banco."""
+        self._upload_running = False
+        self.btn_upload_run.set_loading(False)
+        self.btn_upload_cancel.pack_forget()
+        self.upload_status.config(text="Validacao falhou - codigos SAP nao encontrados")
+        self._append_upload_log(
+            f"[ERRO] Codigos SAP nao encontrados: {missing_codes_str}", "error"
+        )
+        messagebox.showerror(
+            "Validacao SAP",
+            f"Os seguintes codigos SAP nao foram encontrados no banco de dados:\n\n"
+            f"{missing_codes_str}\n\n"
+            f"Corrija os nomes dos arquivos ou cadastre as pecas antes de continuar."
+        )
 
     # ============================================================
     # METODOS - PERFIS
